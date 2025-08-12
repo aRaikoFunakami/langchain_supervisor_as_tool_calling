@@ -333,9 +333,10 @@ if __name__ == "__main__":
         "Add 3 feet and 2 meters in centimeters",
         "Convert the sum of 70 kg and 90 kg to pounds",
         "Search for movies starring Tom Hanks",
-        "スターウォーズについて教えて下さい"
+        "スターウォーズについて教えて下さい",
+        "スターウォーズ１の公開された年と２の公開された年を足すと何年になるか？",
     ]
-    tasks = tasks[3:4]
+    tasks = tasks[6:7]
 
     for task in tasks:
         print(f"Task: {task}")
