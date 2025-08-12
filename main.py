@@ -347,3 +347,14 @@ if __name__ == "__main__":
             }
         ):
             pretty_print_messages(chunk, last_message=True)
+            # 最後のメッセージを取得
+            for node_name, node_update in chunk.items():
+                messages = convert_to_messages(node_update["messages"])
+                if messages:
+                    final_result = messages[-1].content  # 最後のメッセージの内容を取得
+
+        # 最終結果を出力
+        if final_result:
+            print(f"Final Result: {final_result}")
+        else:
+            print("No result was returned.")
