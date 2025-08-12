@@ -8,3 +8,4 @@ wheels/
 
 # Virtual environments
 .venv
+tmdb_agent/.DS_Store

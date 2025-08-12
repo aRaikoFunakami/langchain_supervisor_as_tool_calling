@@ -4,6 +4,12 @@ from langchain_core.messages import convert_to_messages
 from langgraph_supervisor import create_supervisor
 from langgraph.prebuilt import create_react_agent
 
+from langchain_openai import ChatOpenAI
+
+import sys
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../tmdb_agent")))
+from tmdb_agent.agent import create_tmdb_agent
 
 # 四則演算ツールの定義
 @tool("add", description="Adds two numbers.")
@@ -91,7 +97,6 @@ def centimeters_to_meters(centimeters: float) -> float:
     print(f"Converting {centimeters} centimeters to meters.")
     return centimeters / 100
 
-
 # エージェントの初期化
 unit_conversion_agent = create_react_agent(
     model="openai:gpt-4.1-mini",
@@ -107,23 +112,173 @@ unit_conversion_agent = create_react_agent(
     ),
 )
 
+# 既存のAgentExecutorをsupervisor用に変換する関数
+def adapt_agent_executor_for_supervisor(agent_executor, name, debug=False):
+    """Unify normal/debug behavior:
+    - Always extract user input via extract_user_input_multiple_patterns
+    - Emit detailed debug logs only when debug=True
+    """
+    def supervisor_compatible_agent(input_data, config=None):
+        """Supervisor-compatible agent wrapper"""
+        try:
+            # Debug: high-level shape
+            if debug:
+                print("=== TMDB Agent Debug Info ===")
+                print(f"Input data keys: {list(input_data.keys())}")
+                print(f"Input data type: {type(input_data)}")
+                if "messages" in input_data:
+                    messages_dbg = input_data["messages"]
+                    print(f"Messages count: {len(messages_dbg)}")
+                    print(f"Messages type: {type(messages_dbg)}")
+                    for i, msg in enumerate(messages_dbg):
+                        print(f"Message {i}: {type(msg)}")
+                        if isinstance(msg, dict):
+                            print(f"  - Keys: {list(msg.keys())}")
+                            print(f"  - Role: {msg.get('role', 'N/A')}")
+                            # Preview up to 100 chars
+                            print(f"  - Content preview: {str(msg.get('content', 'N/A'))[:100]}")
+                        else:
+                            # Generic object preview
+                            preview = getattr(msg, "content", str(msg))
+                            print(f"  - Role: {getattr(msg, 'role', 'N/A')}")
+                            print(f"  - Content preview: {str(preview)[:100]}")
+                else:
+                    print("No 'messages' key found")
+                    print(f"Available keys: {list(input_data.keys())}")
+                print("================================")
+
+            # Always use the robust extractor
+            user_input = extract_user_input_multiple_patterns(input_data)
+
+            if not user_input:
+                if debug:
+                    print("=== Extended Debug: Full Input Data ===")
+                    print(f"Full input_data: {input_data}")
+                raise ValueError("ユーザー入力が見つかりません")
+
+            if debug:
+                print(f"抽出されたユーザー入力: {user_input}")
+
+            # Invoke wrapped AgentExecutor
+            result = agent_executor.invoke({"input": user_input})
+            output = result.get("output", "検索結果を取得できませんでした")
+
+            if debug:
+                # Trim preview to avoid huge console output
+                print(f"TMDB結果: {str(output)[:200]}...")
+
+            # Return in supervisor message format
+            messages = input_data.get("messages", [])
+            updated_messages = messages + [{
+                "role": "assistant",
+                "content": output,
+                "name": name
+            }]
+
+            return {**input_data, "messages": updated_messages}
+
+        except Exception as e:
+            # Error logging
+            if debug:
+                print(f"TMDBエージェントエラー: {str(e)}")
+                import traceback
+                traceback.print_exc()
+
+            error_message = f"エラーが発生しました: {str(e)}"
+            messages = input_data.get("messages", [])
+            updated_messages = messages + [{
+                "role": "assistant",
+                "content": error_message,
+                "name": name,
+                "metadata": {"error": True}
+            }]
+            return {**input_data, "messages": updated_messages}
+
+    # Provide name attribute and .invoke alias for supervisor
+    supervisor_compatible_agent.name = name
+    supervisor_compatible_agent.invoke = supervisor_compatible_agent
+    return supervisor_compatible_agent
+
+# ユーザー入力を抽出する関数
+def extract_user_input_multiple_patterns(input_data):
+    """input_data からユーザー入力を抽出する関数"""
+    messages = input_data.get("messages", [])
+    for message in reversed(messages):
+        # メッセージが辞書型の場合
+        if isinstance(message, dict) and message.get("role") == "user":
+            return message.get("content", "")
+        # メッセージがLangChainのHumanMessageクラスの場合
+        elif hasattr(message, "content") and type(message).__name__ == "HumanMessage":
+            return message.content
+        # メッセージがクラス型でrole属性がある場合
+        elif hasattr(message, "role") and hasattr(message, "content"):
+            # HumanMessageの場合、roleは通常"human"または"user"
+            if message.role in ["user", "human"]:
+                return message.content
+    
+    # デバッグ情報を追加
+    print("=== Extract Debug ===")
+    for i, message in enumerate(messages):
+        print(f"Message {i}: {type(message)}")
+        if hasattr(message, "role"):
+            print(f"  Role: {message.role}")
+        if hasattr(message, "content"):
+            print(f"  Content: {message.content}")
+        print(f"  Type name: {type(message).__name__}")
+    
+    raise ValueError("ユーザー入力が見つかりません")
+
+
+# TMDBエージェントの初期化
+tmdb_agent = create_tmdb_agent(
+    llm=ChatOpenAI(model="gpt-4.1-mini", temperature=0.1),
+    verbose=True,
+)
+
+# アダプターを適用
+tmdb_supervisor_compatible = adapt_agent_executor_for_supervisor(
+    agent_executor=tmdb_agent.agent_executor,
+    name="tmdb_search_agent"
+)
+
+
+
 # スーパーバイザーの初期化
 supervisor = create_supervisor(
     model=init_chat_model("openai:gpt-4.1-mini"),
     agents=[
         arithmetic_agent,
         unit_conversion_agent,
+        tmdb_supervisor_compatible,  # TMDBエージェントを追加
     ],
     prompt=(
-        "You are a supervisor managing two agents:\n"
-        "- ArithmeticAgent: Handles arithmetic operations.\n"
-        "- UnitConversionAgent: Handles unit conversion tasks.\n"
-        "Assign work to one agent at a time, do not call agents in parallel.\n"
-        "Do not do any work yourself.\n"
-        "Ensure that all calculations, including additions, are performed using the ArithmeticAgent.\n"
-        "Do not perform any calculations yourself, even if the result seems simple.\n"
-        "If a task involves both unit conversion and arithmetic, first use the UnitConversionAgent for conversions,\n"
-        "then delegate all arithmetic operations to the ArithmeticAgent."
+        "You are a supervisor managing three agents:\n"
+        "- ArithmeticAgent: Handles arithmetic operations and mathematical calculations.\n"
+        "- UnitConversionAgent: Handles unit conversion tasks (length, weight, temperature, etc.).\n"
+        "- TMDBSearchAgent: Handles movie, TV show, and celebrity information searches using TMDB API. "
+        "Supports multilingual queries and can search for cast/crew information, plot details, release dates, ratings, etc.\n\n"
+        
+        "ASSIGNMENT RULES:\n"
+        "1. Assign work to ONE agent at a time - do not call agents in parallel.\n"
+        "2. Do not perform any work yourself - always delegate to appropriate agents.\n"
+        "3. For arithmetic: Always use ArithmeticAgent for ALL calculations, even simple additions.\n"
+        "4. For unit conversions: Use UnitConversionAgent.\n"
+        "5. For movie/TV/celebrity queries: Use TMDBSearchAgent for any entertainment content questions.\n\n"
+        
+        "TASK ROUTING:\n"
+        "- Movie/TV show information (plot, cast, release date, ratings) → TMDBSearchAgent\n"
+        "- Celebrity/actor/director information → TMDBSearchAgent\n"
+        "- Entertainment industry questions → TMDBSearchAgent\n"
+        "- Mathematical calculations → ArithmeticAgent\n"
+        "- Unit conversions → UnitConversionAgent\n\n"
+        
+        "COMPLEX TASKS:\n"
+        "If a task involves multiple domains (e.g., unit conversion + arithmetic), handle in sequence:\n"
+        "1. First use UnitConversionAgent for conversions\n"
+        "2. Then use ArithmeticAgent for calculations\n"
+        "3. Use TMDBSearchAgent if entertainment content is involved\n\n"
+        
+        "Always respond in the same language as the user's query."
     ),
     add_handoff_back_messages=True,
     output_mode="full_history",
@@ -177,6 +332,8 @@ if __name__ == "__main__":
         "Convert 5 meters to feet",
         "Add 3 feet and 2 meters in centimeters",
         "Convert the sum of 70 kg and 90 kg to pounds",
+        "Search for movies starring Tom Hanks",
+        "スターウォーズについて教えて下さい"
     ]
     tasks = tasks[3:4]
 
