@@ -9,4 +9,7 @@ dependencies = [
     "langchain-openai>=0.3.29",
     "langdetect>=1.0.9",
     "langgraph-supervisor>=0.0.29",
+    "starlette>=0.47.2",
+    "uvicorn>=0.35.0",
+    "websockets>=15.0.1",
 ]

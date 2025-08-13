@@ -8,8 +8,72 @@ from langchain_openai import ChatOpenAI
 
 import sys
 import os
+
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../tmdb_agent")))
 from tmdb_agent.agent import create_tmdb_agent
+
+# Realtime Server関連のインポート
+import uvicorn
+from starlette.applications import Starlette
+from starlette.responses import HTMLResponse
+from starlette.routing import Route, WebSocketRoute
+
+# langchain_openai_voiceのインポート
+from langchain_openai_voice import OpenAIVoiceReactAgent
+
+# Configuration constants
+REALTIME_SERVER_HOST = "0.0.0.0"
+REALTIME_SERVER_PORT = 3000
+REALTIME_MODEL = "gpt-4o-realtime-preview"
+
+# Realtime Agent Instructions Template
+REALTIME_AGENT_INSTRUCTIONS = """
+You are a helpful voice assistant with access to specialized capabilities through a supervisor agent.
+
+CAPABILITIES:
+- General conversation and simple questions: Handle directly with your built-in knowledge
+- Mathematical calculations: Use supervisor_agent tool
+- Unit conversions: Use supervisor_agent tool  
+- Movie/TV/celebrity information: Use supervisor_agent tool
+
+ROUTING RULES:
+1. For simple greetings, casual conversation, and general knowledge: Respond directly
+2. For ANY mathematical calculation (even simple addition): ALWAYS use supervisor_agent tool
+3. For ANY unit conversion: ALWAYS use supervisor_agent tool
+4. For ANY movie, TV show, or celebrity question: ALWAYS use supervisor_agent tool
+
+EXAMPLES:
+- "Hello" → Respond directly
+- "How are you?" → Respond directly
+- "What's the weather like?" → Respond directly (if you can provide general advice)
+- "What is 2+3?" → Use supervisor_agent tool
+- "Convert 5 meters to feet" → Use supervisor_agent tool
+- "Tell me about Star Wars" → Use supervisor_agent tool
+- "Who is Tom Hanks?" → Use supervisor_agent tool
+
+Always be conversational and helpful. When using the supervisor tool, explain what you're doing.
+Respond in the same language as the user's input.
+"""
+
+# WebSocket utility functions
+async def websocket_stream(websocket):
+    """WebSocketからのメッセージを非同期で受信するストリーム
+    
+    Args:
+        websocket: StarletteのWebSocketインスタンス
+        
+    Returns:
+        AsyncGenerator: WebSocketメッセージのストリーム
+    """
+    try:
+        while True:
+            message = await websocket.receive_text()
+            yield message
+    except Exception as e:
+        print(f"WebSocket stream error: {e}")
+        return
+
+    
 
 # 四則演算ツールの定義
 @tool("add", description="Adds two numbers.")
@@ -284,6 +348,81 @@ supervisor = create_supervisor(
     output_mode="full_history",
 ).compile()
 
+# Supervisorをツールとして使用するための関数
+@tool("supervisor_agent", description="Handles complex tasks requiring arithmetic operations, unit conversions, or movie/TV/celebrity information searches. Use this tool for mathematical calculations, unit conversions, or entertainment content queries.")
+def supervisor_tool(query: str) -> str:
+    """
+    Supervisorエージェントを呼び出すツール
+    Args:
+        query: ユーザーのクエリ（計算、単位変換、映画・TV番組情報検索など）
+    Returns:
+        処理結果の文字列
+    """
+    try:
+        print(f"Supervisor tool called with query: {query}")
+        
+        # Supervisorに送信
+        result_messages = []
+        for chunk in supervisor.stream({
+            "messages": [{"role": "user", "content": query}]
+        }):
+            for node_name, node_update in chunk.items():
+                messages = convert_to_messages(node_update["messages"])
+                if messages:
+                    result_messages.extend(messages)
+        
+        # 最後のアシスタントメッセージを取得
+        for message in reversed(result_messages):
+            if hasattr(message, 'content') and message.content:
+                # assistantまたはエージェント名付きのメッセージを探す
+                if (hasattr(message, 'role') and message.role == 'assistant') or \
+                   (hasattr(message, 'name') and message.name in ['ArithmeticAgent', 'UnitConversionAgent', 'tmdb_search_agent']):
+                    return message.content
+        
+        return "申し訳ありませんが、処理できませんでした。"
+    
+    except Exception as e:
+        print(f"Supervisor tool error: {str(e)}")
+        return f"エラーが発生しました: {str(e)}"
+
+# WebSocket エンドポイント関数
+async def websocket_endpoint(websocket):
+    """WebSocket経由でRealtime Agentとの通信を処理
+    
+    Args:
+        websocket: StarletteのWebSocketインスタンス
+    """
+    try:
+        await websocket.accept()
+        
+        # WebSocketストリームを作成
+        browser_receive_stream = websocket_stream(websocket)
+        
+        # Realtime Agentを初期化して接続
+        agent = _create_realtime_agent()
+        await agent.aconnect(browser_receive_stream, websocket.send_text)
+        
+    except Exception as e:
+        print(f"WebSocket endpoint error: {e}")
+        if websocket.client_state.value == 1:  # CONNECTING or CONNECTED
+            await websocket.close(code=1011, reason="Internal server error")
+
+
+def _create_realtime_agent():
+    """Realtime Agentを作成する内部関数
+    
+    Returns:
+        OpenAIVoiceReactAgent: 設定済みのエージェントインスタンス
+    """
+    return OpenAIVoiceReactAgent(
+        model=REALTIME_MODEL,
+        tools=[supervisor_tool],
+        instructions=REALTIME_AGENT_INSTRUCTIONS,
+    )
+
+# ホームページ関数
+async def homepage(request):
+    return HTMLResponse('wscat -c \"ws://127.0.0.1:3000/ws\"')
 
 
 def pretty_print_message(message, indent=False):
@@ -325,37 +464,93 @@ def pretty_print_messages(update, last_message=False):
             pretty_print_message(m, indent=is_subgraph)
         print("\n")
 
-# スーパーバイザーの使用例
-if __name__ == "__main__":
+# Realtime Server関数
+def start_realtime_server():
+    """Realtime ServerをWebSocketサーバーとして起動
+    
+    Returns:
+        bool: サーバー起動の成功/失敗
+    """
+    _print_server_info()
+    
+    app = _create_starlette_app()
+    
+    try:
+        uvicorn.run(app, host=REALTIME_SERVER_HOST, port=REALTIME_SERVER_PORT)
+        return True
+    except Exception as e:
+        print(f"Failed to start realtime server: {e}")
+        return False
+
+
+def _print_server_info():
+    """サーバー起動情報を表示する内部関数"""
+    print("Starting Realtime Server with Supervisor integration...")
+    print(f"Server will be available at: http://{REALTIME_SERVER_HOST}:{REALTIME_SERVER_PORT}")
+    print(f"WebSocket endpoint: ws://{REALTIME_SERVER_HOST}:{REALTIME_SERVER_PORT}/ws")
+    print("\nThe realtime agent will:")
+    print("- Handle simple conversations directly")
+    print("- Use supervisor for mathematical calculations")
+    print("- Use supervisor for unit conversions")
+    print("- Use supervisor for movie/TV/celebrity information")
+    print("\nPress Ctrl+C to stop the server.")
+
+
+def _create_starlette_app():
+    """Starletteアプリケーションを作成する内部関数
+    
+    Returns:
+        Starlette: 設定済みのアプリケーションインスタンス
+    """
+    routes = [
+        Route("/", homepage),
+        WebSocketRoute("/ws", websocket_endpoint)
+    ]
+    
+    return Starlette(debug=True, routes=routes)
+
+def run_test_mode():
+    """Test mode でSupervisorの機能をテスト実行"""
     tasks = [
         "Calculate 2*(3+4)/5",
-        "Convert 5 meters to feet",
+        "Convert 5 meters to feet", 
         "Add 3 feet and 2 meters in centimeters",
         "Convert the sum of 70 kg and 90 kg to pounds",
         "Search for movies starring Tom Hanks",
         "スターウォーズについて教えて下さい",
         "スターウォーズ１の公開された年と２の公開された年を足すと何年になるか？",
     ]
-    tasks = tasks[6:7]
-
+    
+    print("Running test mode with sample tasks...")
     for task in tasks:
-        print(f"Task: {task}")
-        for chunk in supervisor.stream(
-            {
-                "messages": [
-                    {"role": "user", "content": task}
-                ]
-            }
-        ):
+        print(f"\nTask: {task}")
+        for chunk in supervisor.stream({
+            "messages": [{"role": "user", "content": task}]
+        }):
             pretty_print_messages(chunk, last_message=True)
-            # 最後のメッセージを取得
-            for node_name, node_update in chunk.items():
-                messages = convert_to_messages(node_update["messages"])
-                if messages:
-                    final_result = messages[-1].content  # 最後のメッセージの内容を取得
 
-        # 最終結果を出力
-        if final_result:
-            print(f"Final Result: {final_result}")
-        else:
-            print("No result was returned.")
+# メイン実行部分
+def main():
+    """メイン実行関数"""
+    parser = argparse.ArgumentParser(description="Realtime-enabled Supervisor Agent")
+    parser.add_argument(
+        "--test", 
+        action="store_true", 
+        help="Run test tasks to verify the supervisor functionality"
+    )
+    
+    args = parser.parse_args()
+    
+    if args.test:
+        print("Running test mode...")
+        run_test_mode()
+    else:
+        print("Starting Realtime mode (WebSocket server)...")
+        success = start_realtime_server()
+        if not success:
+            print("Failed to start realtime server.")
+
+
+if __name__ == "__main__":
+    import argparse
+    main()
